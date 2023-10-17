@@ -1,0 +1,260 @@
+
+#include <ESP8266WiFi.h>
+#include <Ticker.h>
+#include <AsyncMqttClient.h>
+#include <SoftwareSerial.h>
+ 
+#include <Servo.h>
+Servo myservo;  // create servo object to control a servo
+
+#define WIFI_SSID "Hello"
+#define WIFI_PASSWORD "987654321"
+
+#define MQTT_PUB_TOPIC "david/project/bin/app"
+#define MQTT_SUB_TOPIC "david/project/app/bin"
+
+#define MQTT_HOST "broker.emqx.io"
+#define MQTT_PORT 1883
+AsyncMqttClient mqttClient;
+Ticker mqttReconnectTimer; 
+WiFiEventHandler wifiConnectHandler;
+WiFiEventHandler wifiDisconnectHandler;
+Ticker wifiReconnectTimer;
+
+int pos = 0;
+bool binIsOpened = false, binIsFull = false, binIsLocked = false;
+
+int TriggerPinInside = D5;
+int EchoPinInside = D6;
+int TriggerPinOutside = D7;
+int EchoPinOutside = D8;
+int redLED = D3;
+int amberLED = D4;
+
+void connectToWifi() {
+  Serial.println("Connecting to Wi-Fi...");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+}
+
+void connectToMqtt() {
+  Serial.println("Connecting to MQTT...");
+  mqttClient.connect();
+}
+
+void onWifiConnect(const WiFiEventStationModeGotIP& event) {
+  Serial.println("Connected to Wi-Fi.");
+  connectToMqtt();
+}
+
+void onWifiDisconnect(const WiFiEventStationModeDisconnected& event) {
+  Serial.println("Disconnected from Wi-Fi.");
+  mqttReconnectTimer.detach(); // ensure we don't reconnect to MQTT while reconnecting to Wi-Fi
+  wifiReconnectTimer.once(2, connectToWifi);
+}
+
+void onMqttConnect(bool sessionPresent) {
+  Serial.println("Connected to MQTT.");
+  Serial.print("Session present: ");
+  Serial.println(sessionPresent);
+  uint16_t packetIdSub = mqttClient.subscribe(MQTT_SUB_TOPIC, 2);
+  Serial.print("Subscribing at QoS 2, packetId: ");
+  Serial.println(packetIdSub);
+}
+
+void onMqttDisconnect(AsyncMqttClientDisconnectReason reason) {
+  Serial.println("Disconnected from MQTT.");
+
+  if (WiFi.isConnected()) {
+    mqttReconnectTimer.once(2, connectToMqtt);
+  }
+}
+
+void onMqttSubscribe(uint16_t packetId, uint8_t qos) {
+  Serial.println("Subscribe acknowledged.");
+  Serial.print("  packetId: ");
+  Serial.println(packetId);
+  Serial.print("  qos: ");
+  Serial.println(qos);
+}
+
+void onMqttUnsubscribe(uint16_t packetId) {
+  Serial.println("Unsubscribe acknowledged.");
+  Serial.print("  packetId: ");
+  Serial.println(packetId);
+}
+
+void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProperties properties, size_t len, size_t index, size_t total) {
+  Serial.println("Publish received.");
+  Serial.print("  topic: ");
+  Serial.println(topic);
+  Serial.print("  payload: ");
+  Serial.println(payload);
+  String message = String(payload);
+  Serial.print("  message: ");
+  Serial.println("\n\nMessage Received from App" + message + "\n\n");
+
+  if (message.charAt(0) == '0') {
+    Serial.print("Unlock command received from app");
+    unlockBin();
+  } else if (message.charAt(0) == '1') {
+    Serial.print("Lock command received from app");
+    lockBin();
+  } else {
+    Serial.print("Unknown message received from app");
+  }
+}
+
+void onMqttPublish(uint16_t packetId) {
+  Serial.println("Publish acknowledged.");
+  Serial.print("  packetId: ");
+  Serial.println(packetId);
+}
+
+void setup() {
+  pinMode(TriggerPinInside, OUTPUT);
+  pinMode(EchoPinInside, INPUT);
+  pinMode(TriggerPinOutside, OUTPUT);
+  pinMode(EchoPinOutside, INPUT);
+  Serial.begin(115200);
+  myservo.attach(D2);
+  Serial.println("Starting...");
+
+  wifiConnectHandler = WiFi.onStationModeGotIP(onWifiConnect);
+  wifiDisconnectHandler = WiFi.onStationModeDisconnected(onWifiDisconnect);
+
+  mqttClient.onConnect(onMqttConnect);
+  mqttClient.onDisconnect(onMqttDisconnect);
+  mqttClient.onSubscribe(onMqttSubscribe);
+  mqttClient.onUnsubscribe(onMqttUnsubscribe);
+  mqttClient.onMessage(onMqttMessage);
+  mqttClient.onPublish(onMqttPublish);
+  mqttClient.setServer(MQTT_HOST, MQTT_PORT);
+
+  connectToWifi();
+}
+
+void loop() {
+  digitalWrite(TriggerPinOutside, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TriggerPinOutside, HIGH);
+  delayMicroseconds(2);
+  digitalWrite(TriggerPinOutside, LOW);
+
+  long td = pulseIn(EchoPinOutside, HIGH);
+  int distanceOutside = 0.0343 * (td / 2);
+
+  Serial.print("\nDistance outside : ");
+  Serial.println(distanceOutside);
+  delayMicroseconds(2);
+
+  if (distanceOutside < 30) {
+    Serial.println("Person in front of bin");
+
+    if (binIsLocked == true) {
+      Serial.println("Bin is locked by owner. Can't Open\n.Flash LED");
+      flashAmberLED();
+    }
+    else {
+      if (binIsFull == true) {
+        Serial.println("Bin is filled. Can't Open\n.Flash LED");
+        flashRedLED();
+      } else {
+        digitalWrite(redLED, LOW);
+        openBin();
+      }
+    }
+  } else {
+    Serial.println("No one around");
+    closeBin();
+  }
+
+  delayMicroseconds(2);
+
+  if (binIsOpened == false) {
+    digitalWrite(TriggerPinInside, LOW);
+    delayMicroseconds(2);
+    digitalWrite(TriggerPinInside, HIGH);
+    delayMicroseconds(2);
+    digitalWrite(TriggerPinInside, LOW);
+
+    long timedelay = pulseIn(EchoPinInside, HIGH);
+    int distanceInside = 0.0343 * (timedelay / 2);
+
+    Serial.print("Distance Inside bin : ");
+    Serial.println(distanceInside);
+    delayMicroseconds(2);
+
+    if (distanceInside < 15) {
+      Serial.println("Bin is filled");
+      binIsFull = true;
+    } else {
+      Serial.println("Bin still has space");
+      binIsFull = false;
+    }
+  }
+  String message = String(binIsFull == true ? 1 : 0) + "^" + String(binIsOpened == true ? 1 : 0) + "^" + String(binIsLocked == true ? 1 : 0) + "^" + String(distanceOutside) ;
+  Serial.println("Message to App: " + message);
+  uint16_t packetIdPub1 = mqttClient.publish(MQTT_PUB_TOPIC, 1, true, String(message).c_str());
+  delay(2000);
+}
+
+void flashAmberLED() {
+  digitalWrite(amberLED, LOW);
+  digitalWrite(amberLED, HIGH);
+  delay(50);
+  digitalWrite(amberLED, LOW);
+  delay(50);
+  digitalWrite(amberLED, HIGH);
+  delay(50);
+  digitalWrite(amberLED, LOW);
+  delay(50);
+  digitalWrite(amberLED, LOW);
+}
+
+void flashRedLED() {
+  digitalWrite(redLED, LOW);
+  digitalWrite(redLED, HIGH);
+  delay(50);
+  digitalWrite(redLED, LOW);
+  delay(50);
+  digitalWrite(redLED, HIGH);
+  delay(50);
+  digitalWrite(redLED, LOW);
+  delay(50);
+  digitalWrite(redLED, HIGH);
+}
+
+void lockBin() {
+  binIsLocked = true;
+  digitalWrite(amberLED, true);
+}
+
+void unlockBin() {
+  binIsLocked = false;
+  digitalWrite(amberLED, LOW);
+}
+
+void openBin() {
+  if (binIsOpened == false) {
+    Serial.print("Opening the bin . . .");
+    binIsOpened = true;
+    for (pos = 0; pos <= 150; pos += 1) { // goes from 0 degrees to 180 degrees
+      // in steps of 1 degree
+      myservo.write(pos);       // tell servo to go to position in variable 'pos'
+      delay(15);                // waits 15ms for the servo to reach the position
+    }
+    Serial.println("Done\n");
+  }
+}
+
+void closeBin() {
+  if (binIsOpened == true) {
+    Serial.print("Closing the bin . . .");
+    for (pos = 150; pos >= 0; pos -= 1) { // goes from 180 degrees to 0 degrees
+      myservo.write(pos);        // tell servo to go to position in variable 'pos'
+      delay(15);                 // waits 15ms for the servo to reach the position
+    }
+    binIsOpened = false;
+    Serial.println("Done\n");
+  }
+}
